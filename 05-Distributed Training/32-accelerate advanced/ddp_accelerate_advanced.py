@@ -8,7 +8,7 @@ from accelerate import Accelerator
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.data import random_split
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, TaskType
 from transformers import BertTokenizer, BertForSequenceClassification
 
 
@@ -53,7 +53,7 @@ def prepare_model_and_optimizer():
 
     model = BertForSequenceClassification.from_pretrained("/gemini/code/model")
 
-    lora_config = LoraConfig(target_modules=["query", "key", "value"])
+    lora_config = LoraConfig(task_type=TaskType.SEQ_CLS, target_modules=["query", "key", "value"])
 
     model = get_peft_model(model, lora_config)
 
@@ -83,17 +83,23 @@ def train(model, optimizer, trainloader, validloader, accelerator: Accelerator, 
     resume_step = 0
     resume_epoch = 0
 
-    if resume is not None:
+    if resume is not None: 
+        # 计算当前训练好的模型所在的epoch和多出来的部分step
         accelerator.load_state(resume)
+        # 向上取整计算训练每个epoch需要的step数
         steps_per_epoch = math.ceil(len(trainloader) / accelerator.gradient_accumulation_steps)
+        # 当前的step，注意也要更新下global_step
         resume_step = global_step = int(resume.split("step_")[-1])
+        # 当前训练了多少epoch
         resume_epoch = resume_step // steps_per_epoch
+        # 多训练出来的step数，因为多出来的step要跳过训练
         resume_step -= resume_epoch * steps_per_epoch
         accelerator.print(f"resume from checkpoint -> {resume}")
 
     for ep in range(resume_epoch, epoch):
         model.train()
         if resume and ep == resume_epoch and resume_step != 0:
+            # 跳过这一个epoch已经训练过的batch，注意这里是resume_step乘梯度累积步数才是batchs
             active_dataloader = accelerator.skip_first_batches(trainloader, resume_step * accelerator.gradient_accumulation_steps)
         else:
             active_dataloader = trainloader
@@ -114,12 +120,14 @@ def train(model, optimizer, trainloader, validloader, accelerator: Accelerator, 
                         accelerator.log({"loss": loss.item()}, global_step)
 
                     if global_step % 50 == 0 and global_step != 0:
+                        # 断点续训，保存模型的state
                         accelerator.print(f"save checkpoint -> step_{global_step}")
                         accelerator.save_state(accelerator.project_dir + f"/step_{global_step}")
+                        # 解包并保存模型，路径与上面断点续训的路径区分开
                         accelerator.unwrap_model(model).save_pretrained(
                             save_directory=accelerator.project_dir + f"/step_{global_step}/model",
-                            is_main_process=accelerator.is_main_process,
-                            state_dict=accelerator.get_state_dict(model),
+                            is_main_process=accelerator.is_main_process,  # 主进程保存模型即可
+                            state_dict=accelerator.get_state_dict(model), # 保存模型参数
                             save_func=accelerator.save
                         )
         acc = evaluate(model, validloader, accelerator)
